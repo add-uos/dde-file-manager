@@ -6,6 +6,7 @@
 #include <QProcess>
 #include <QDebug>
 #include <QStringList>
+#include <mutex>
 
 SERVICETEXTINDEX_BEGIN_NAMESPACE
 
@@ -59,6 +60,16 @@ bool executeSystemctlCommand(const QStringList &arguments, QString *errorMsg)
 // 实现 SystemdCpuUtils 命名空间中的函数
 namespace SystemdCpuUtils {
 
+// 全局引用计数器：跟踪当前有多少个限制型任务(Light/Medium/Heavy)在运行。
+// 只有计数从 0→1 时才实际 setCpuQuota，从 1→0 时才实际 resetCpuQuota。
+// Manual 任务不改变计数器，仅在计数为 0 时才 reset。
+//
+// 使用 mutex 而非裸原子计数器：TextIndex 和 OcrIndex 共享同一进程但各自有独立的
+// worker 线程，setCpuQuota/resetCpuQuota 调用必须在锁保护下进行，否则一个线程
+// 的 resetCpuQuota 可能覆盖另一个线程刚设置的 setCpuQuota，导致 CPU 限制失效。
+static std::mutex g_cpuQuotaMutex;
+static int g_limitedTaskCount { 0 };
+
 bool setCpuQuota(const QString &serviceName, int percentage, QString *errorMsg)
 {
     Q_ASSERT(errorMsg);
@@ -99,6 +110,45 @@ bool resetCpuQuota(const QString &serviceName, QString *errorMsg)
               << "CPUQuota=";   // 设置为空字符串以取消限制
 
     return executeSystemctlCommand(arguments, errorMsg);   // 调用匿名命名空间中的辅助函数
+}
+
+void acquireCpuQuota(const QString &serviceName, int percentage)
+{
+    std::lock_guard<std::mutex> lock(g_cpuQuotaMutex);
+    if (g_limitedTaskCount == 0) {
+        QString msg;
+        if (!setCpuQuota(serviceName, percentage, &msg)) {
+            fmWarning() << "SystemdCpuUtils: acquireCpuQuota failed to set CPU quota:" << msg;
+        }
+    }
+    ++g_limitedTaskCount;
+}
+
+void releaseCpuQuota(const QString &serviceName)
+{
+    std::lock_guard<std::mutex> lock(g_cpuQuotaMutex);
+    if (g_limitedTaskCount <= 0) {
+        fmWarning() << "SystemdCpuUtils: releaseCpuQuota called with no active limited tasks";
+        return;
+    }
+    --g_limitedTaskCount;
+    if (g_limitedTaskCount == 0) {
+        QString msg;
+        if (!resetCpuQuota(serviceName, &msg)) {
+            fmWarning() << "SystemdCpuUtils: releaseCpuQuota failed to reset CPU quota:" << msg;
+        }
+    }
+}
+
+void manualTaskCpuQuota(const QString &serviceName)
+{
+    std::lock_guard<std::mutex> lock(g_cpuQuotaMutex);
+    if (g_limitedTaskCount == 0) {
+        QString msg;
+        if (!resetCpuQuota(serviceName, &msg)) {
+            fmWarning() << "SystemdCpuUtils: manualTaskCpuQuota failed to reset CPU quota:" << msg;
+        }
+    }
 }
 
 }   // namespace SystemdCpuUtils

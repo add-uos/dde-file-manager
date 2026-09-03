@@ -58,6 +58,7 @@
 #include <QMimeData>
 #include <QLayout>
 #include <QAccessible>
+#include <algorithm>
 
 using namespace dfmplugin_workspace;
 DFMGLOBAL_USE_NAMESPACE
@@ -68,6 +69,8 @@ using namespace GlobalDConfDefines::BaseConfig;
 FileView::FileView(const QUrl &url, QWidget *parent)
     : DListView(parent), d(new FileViewPrivate(this))
 {
+    setObjectName("dd_file_view");
+    setAccessibleName("dd_file_view");
     d->url = url;
     setMinimumHeight(10);
     setDragDropMode(QAbstractItemView::DragDrop);
@@ -155,6 +158,15 @@ FileView::~FileView()
         d->selectHelper = nullptr;
     }
 
+    // 3.5 显式清理无障碍接口缓存中的 QAccessibleTableCell 对象。
+    //     QAccessibleTableCell 持有 QPersistentModelIndex 且 object() 返回 nullptr,
+    //     不会被 objectDestroyed() 清理, 仅在 ~QAccessibleCache() (~QApplication) 时析构。
+    //     若不在模型存活时清理, 模型销毁后 ~QPersistentModelIndex 将访问悬空模型指针。
+#if QT_CONFIG(accessibility)
+    if (auto *iface = QAccessible::queryAccessibleInterface(this))
+        QAccessible::deleteAccessibleInterface(QAccessible::uniqueId(iface));
+#endif
+
     // 4. 解绑 model(关键步骤): 会触发 QAbstractItemView 清理持有的 QPersistentModelIndex
     DListView::setModel(nullptr);
 
@@ -169,7 +181,6 @@ FileView::~FileView()
 
     // 6. 清理其他订阅
     dpfSignalDispatcher->unsubscribe("dfmplugin_workspace", "signal_View_HeaderViewSectionChanged", this, &FileView::onHeaderViewSectionChanged);
-    dpfSignalDispatcher->unsubscribe("dfmplugin_filepreview", "signal_ThumbnailDisplay_Changed", this, &FileView::onWidgetUpdate);
 
     fmDebug() << "FileView destruction completed";
 
@@ -178,7 +189,7 @@ FileView::~FileView()
 
 QWidget *FileView::widget() const
 {
-    return const_cast<FileView *>(this);
+    return const_cast<FileView *>(this);   // AbstractBaseView::widget() returns non-const QWidget*; FileView IS-A QWidget, so const_cast is the idiomatic bridge / AbstractBaseView::widget() 返回非 const QWidget*,而 FileView 本身就是 QWidget,const_cast 是惯用桥接
 }
 
 QWidget *FileView::contentWidget() const
@@ -191,7 +202,7 @@ void FileView::setViewMode(Global::ViewMode mode)
     // itemDelegate 未设置时为未初始化状态，此时调用setViewMode需要执行设置流程
     // itemDelegate 已设置时，若view不可见，则暂不执行viewMode设置逻辑
     if (!isVisible() && itemDelegate()
-        && d->delegates[static_cast<int>(mode)] == itemDelegate()) {
+        && d->delegates.value(static_cast<int>(mode)) == itemDelegate()) {
         fmDebug() << "View mode change skipped: view not visible and delegate already set for mode:" << static_cast<int>(mode);
         return;
     }
@@ -206,7 +217,7 @@ void FileView::setViewMode(Global::ViewMode mode)
     }
 
     int delegateModeIndex = mode == Global::ViewMode::kTreeMode ? static_cast<int>(Global::ViewMode::kListMode) : static_cast<int>(mode);
-    if (d->delegates.keys().contains(delegateModeIndex)) {
+    if (d->delegates.contains(delegateModeIndex)) {
         d->currentViewMode = mode;
         fmDebug() << "View mode set successfully to:" << static_cast<int>(mode);
     } else {
@@ -218,8 +229,10 @@ void FileView::setViewMode(Global::ViewMode mode)
     // 切换视图模式前记录当前选中文件，以便切换视图模式后文件数量变化了也能保持存在文件的选中状态。
     recordSelectedUrls();
 
-    setItemDelegate(d->delegates[delegateModeIndex]);
+    setItemDelegate(d->delegates.value(delegateModeIndex));
     switch (d->currentViewMode) {
+    case Global::ViewMode::kNoneMode:
+        break;
     case Global::ViewMode::kIconMode:
         d->initHorizontalOffset = false;
         setUniformItemSizes(false);
@@ -233,10 +246,9 @@ void FileView::setViewMode(Global::ViewMode mode)
         verticalScrollBar()->setFixedHeight(rect().height() - d->statusBar->height());
         break;
     case Global::ViewMode::kListMode:
-        d->delegates[static_cast<int>(Global::ViewMode::kListMode)]->setPaintProxy(new ListItemPaintProxy(this));
         setIconSize(QSize(kListViewIconSize, kListViewIconSize));
         viewport()->setContentsMargins(0, 0, 0, 0);
-        d->delegates[static_cast<int>(Global::ViewMode::kListMode)]->setPaintProxy(new ListItemPaintProxy(this));
+        d->delegates.value(static_cast<int>(Global::ViewMode::kListMode))->setPaintProxy(new ListItemPaintProxy(this));
         model()->setTreeView(false);
         setListViewMode();
         break;
@@ -247,10 +259,10 @@ void FileView::setViewMode(Global::ViewMode mode)
         if (d->itemsExpandable) {
             auto proxy = new TreeItemPaintProxy(this);
             proxy->setStyleProxy(style());
-            d->delegates[static_cast<int>(Global::ViewMode::kListMode)]->setPaintProxy(proxy);
+            d->delegates.value(static_cast<int>(Global::ViewMode::kListMode))->setPaintProxy(proxy);
             model()->setTreeView(true);
         } else {
-            d->delegates[static_cast<int>(Global::ViewMode::kListMode)]->setPaintProxy(new ListItemPaintProxy(this));
+            d->delegates.value(static_cast<int>(Global::ViewMode::kListMode))->setPaintProxy(new ListItemPaintProxy(this));
             model()->setTreeView(false);
         }
         setIconSize(QSize(kListViewIconSize, kListViewIconSize));
@@ -258,8 +270,8 @@ void FileView::setViewMode(Global::ViewMode mode)
         break;
     case Global::ViewMode::kAllViewMode:
         break;
-    default:
-        break;
+    // 无 default 分支:新增 ViewMode 时由 -Wswitch 提示补全
+    // No default label: -Wswitch prompts completion when new ViewMode values are added
     }
     fmDebug() << "View mode change completed for URL:" << rootUrl().toString();
 }
@@ -274,7 +286,7 @@ void FileView::setDelegate(Global::ViewMode mode, BaseItemDelegate *view)
     if (!view)
         return;
 
-    auto delegate = d->delegates[static_cast<int>(mode)];
+    auto delegate = d->delegates.value(static_cast<int>(mode));
     if (delegate) {
         if (delegate->parent())
             delegate->setParent(nullptr);
@@ -498,17 +510,27 @@ void FileView::onSectionHandleDoubleClicked(int logicalIndex)
 
     int columnMaxWidth = 0;
 
+    BaseItemDelegate *delegate = itemDelegate();
+    if (!delegate)
+        return;
+
     for (int i = 0; i < rowCount; ++i) {
         const QModelIndex &index = model()->index(i, 0, rootIndex());
-        const QList<QRect> &list = itemDelegate()->paintGeomertys(option, index, true);
+        const QList<QRect> &list = delegate->paintGeomertys(option, index, true);
 
         // 第0列为文件名列，此列比较特殊，因为前面还有文件图标占用了一部分空间
+        // Column 0 is the file-name column, special-cased because the icon occupies leading space
         int width = 0;
 
         if (logicalIndex == 0) {
             // 树形视图多绘制一个扩展标识，名称是第三列
-            width = list.at(currentViewMode() == Global::ViewMode::kTreeMode ? 2 : 1).right() + kColumnPadding / 2;
+            int nameIndex = currentViewMode() == Global::ViewMode::kTreeMode ? 2 : 1;
+            if (list.size() <= nameIndex)
+                continue;
+            width = list.at(nameIndex).right() + kColumnPadding / 2;
         } else {
+            if (list.size() <= logicalIndex + 1)
+                continue;
             width = list.at(logicalIndex + 1).width() + kColumnPadding * 2;
         }
 
@@ -557,8 +579,6 @@ void FileView::onHeaderSectionMoved(int logicalIndex, int oldVisualIndex, int ne
 void FileView::onHeaderHiddenChanged(const QString &roleName, const bool isHidden)
 {
     fmDebug() << "Header hidden changed - role:" << roleName << "hidden:" << isHidden << "for URL:" << rootUrl().toString();
-
-    d->columnForRoleHiddenMap[roleName] = isHidden;
 
     const QUrl &url = rootUrl();
     if (d->shouldPersistState(url)) {
@@ -844,7 +864,7 @@ void FileView::setGroup(const QString &strategyName, const Qt::SortOrder order)
     d->adjustIconModeSpacing(strategyName);
 }
 
-GroupingState FileView::groupingState()
+GroupingState FileView::groupingState() const
 {
     return model()->groupingState();
 }
@@ -882,8 +902,9 @@ QRectF FileView::itemRect(const QUrl &url, const ItemRoles role) const
         return rect;
     }
     default:
-        return QRectF();
+        break;
     }
+    return QRectF();
 }
 
 bool FileView::isVerticalScrollBarSliderDragging() const
@@ -925,7 +946,7 @@ void FileView::updateViewportContentsMargins(const QSize &itemSize)
     viewport()->setContentsMargins(margin, 0, margin, 0);
 }
 
-bool FileView::indexInRect(const QRect &actualRect, const QModelIndex &index)
+bool FileView::indexInRect(const QRect &actualRect, const QModelIndex &index) const
 {
     return d->geometryHelper->indexInRect(actualRect, index);
 }
@@ -955,15 +976,6 @@ void FileView::aboutToChangeWidth(int deltaWidth)
     d->animationHelper->playAnimationWithWidthChange(deltaWidth);
 }
 
-void FileView::initDefaultHeaderView()
-{
-    if (!model())
-        return;
-
-    auto roleName = model()->roleDisplayString(kItemFileCreatedRole);
-    d->columnForRoleHiddenMap[roleName] = true;
-}
-
 void FileView::onHeaderViewMousePressed()
 {
     d->oldHeaderViewLenght = d->headerView->length();
@@ -978,7 +990,7 @@ void FileView::onSelectAndEdit(const QUrl &url)
     if (!WorkspaceHelper::kSelectionAndRenameFile.contains(winId))
         return;
 
-    QPair<QUrl, QUrl> urlPair = WorkspaceHelper::kSelectionAndRenameFile[winId];
+    std::pair<QUrl, QUrl> urlPair = WorkspaceHelper::kSelectionAndRenameFile[winId];
     if (!UniversalUtils::urlEquals(urlPair.first, rootUrl()) || !UniversalUtils::urlEquals(urlPair.second, url))
         return;
 
@@ -1276,7 +1288,10 @@ QModelIndex FileView::iconIndexAt(const QPoint &pos, const QSize &itemSize) cons
 
 bool FileView::expandOrCollapseItem(const QModelIndex &index, const QPoint &pos)
 {
-    QRect arrowRect = itemDelegate()->getRectOfItem(RectOfItemType::kItemTreeArrowRect, index);
+    BaseItemDelegate *de = itemDelegate();
+    if (!de)
+        return false;
+    QRect arrowRect = de->getRectOfItem(RectOfItemType::kItemTreeArrowRect, index);
 
     if (!arrowRect.contains(pos))
         return false;
@@ -1313,7 +1328,10 @@ bool FileView::groupExpandOrCollapseItem(const QModelIndex &index, const QPoint 
         op.rect.setTop(op.rect.top() + kGroupHeaderInterval);
     }
 
-    QRect arrowRect = itemDelegate()->getExpandButtonHitRect(op);
+    BaseItemDelegate *de = itemDelegate();
+    if (!de)
+        return false;
+    QRect arrowRect = de->getExpandButtonHitRect(op);
 
     if (!arrowRect.contains(pos))
         return false;
@@ -1644,7 +1662,8 @@ void FileView::mousePressEvent(QMouseEvent *event)
 
         if (!isEmptyArea) {
             const QModelIndex &index = indexAt(event->pos());
-            if (selectedIndexes().isEmpty() || !selectedIndexes().contains(index)) {
+            const QModelIndexList &selected = selectedIndexes();
+            if (selected.isEmpty() || !selected.contains(index)) {
                 setCurrentIndex(index);
             }
         }
@@ -1839,7 +1858,7 @@ int FileView::verticalOffset() const
     return DListView::verticalOffset();
 }
 
-QList<ItemRoles> FileView::getColumnRoles() const
+const QList<ItemRoles> &FileView::getColumnRoles() const
 {
     return d->columnRoles;
 }
@@ -1998,7 +2017,8 @@ void FileView::contextMenuEvent(QContextMenuEvent *event)
 
     d->viewMenuHelper->setWaitCursor();
     const QModelIndex &index = indexAt(event->pos());
-    if (itemDelegate()->editingIndex().isValid() && itemDelegate()->editingIndex() == index) {
+    BaseItemDelegate *delegate = itemDelegate();
+    if (delegate && delegate->editingIndex().isValid() && delegate->editingIndex() == index) {
         fmDebug() << "Setting focus due to editing index";
         setFocus(Qt::FocusReason::OtherFocusReason);
     }
@@ -2014,7 +2034,8 @@ void FileView::contextMenuEvent(QContextMenuEvent *event)
     } else {
         if (!isSelected(index)) {
             fmDebug() << "Item not selected, clearing selection and selecting clicked item";
-            itemDelegate()->hideNotEditingIndexWidget();
+            if (delegate)
+                delegate->hideNotEditingIndexWidget();
             clearSelection();
 
             if (!index.isValid()) {
@@ -2265,7 +2286,8 @@ void FileView::paintEvent(QPaintEvent *event)
 
     if (d->animationHelper->isWaitingToPlaying() || d->animationHelper->isAnimationPlaying()) {
         d->animationHelper->paintItems();
-        itemDelegate()->hideAllIIndexWidget();
+        if (auto *de = itemDelegate())
+            de->hideAllIIndexWidget();
         return;
     }
 
@@ -2656,9 +2678,7 @@ void FileView::updateListHeaderView()
             }
         }
 
-        const QString &columnName = model()->headerData(i, Qt::Horizontal, Qt::DisplayRole).toString();
         bool hidden = hiddenState.value(QString::number(curRole), curRole == kItemFileCreatedRole).toBool();
-        d->columnForRoleHiddenMap[columnName] = hidden;
         d->headerView->setSectionHidden(logicalIndex, hidden);
     }
 
@@ -2712,7 +2732,7 @@ QUrl FileView::parseSelectedUrl(const QUrl &url)
         if (const FileInfoPointer &currentFileInfo = InfoFactory::create<FileInfo>(rootUrl())) {
             if (UrlRoute::isAncestorsUrl(rootUrl(), fileUrl, &ancestors)) {
                 d->preSelectionUrls.clear();
-                d->preSelectionUrls << (ancestors.count() > 1 ? ancestors.at(ancestors.count() - 2) : rootUrl());
+                d->preSelectionUrls << (ancestors.size() > 1 ? ancestors.at(ancestors.size() - 2) : rootUrl());
             }
         }
     }
@@ -2889,7 +2909,7 @@ QModelIndex FileView::indexAtForSelection(const QPoint &pos) const
         // For list mode (single column), clamp X coordinate to viewport range
         // Only Y coordinate matters for determining which row is selected
         QPoint clampedPos = pos;
-        clampedPos.setX(qBound(0, pos.x(), viewport()->width() - 1));
+        clampedPos.setX(std::clamp(pos.x(), 0, viewport()->width() - 1));
         return DListView::indexAt(clampedPos);
     }
 
@@ -2942,7 +2962,7 @@ int FileView::stickyHeaderHeight() const
     return d->stickyHelper->stickyHeaderHeight();
 }
 
-QModelIndex FileView::findStickyGroupIndex(int headerHeight)
+QModelIndex FileView::findStickyGroupIndex(int headerHeight) const
 {
     return d->stickyHelper->findStickyGroupIndex(headerHeight);
 }

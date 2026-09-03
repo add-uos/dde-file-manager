@@ -5,7 +5,6 @@
 #include "textindexdbus.h"
 #include "private/textindexdbus_p.h"
 #include "utils/indexutility.h"
-#include "utils/systemdcpuutils.h"
 #include "utils/textindexconfig.h"
 
 #include <QDir>
@@ -36,17 +35,17 @@ void TextIndexDBusPrivate::initConnect()
 {
     QObject::connect(runtime->taskManager(), &TaskManager::taskFinished,
                      q, [this](const QString &type, const QString &path, bool success) {
-                         QString msg;
-                         fmDebug() << "TextIndexDBus: Resetting CPU limit after task completion";
-                         if (!SystemdCpuUtils::resetCpuQuota(Defines::kTextIndexServiceName, &msg)) {
-                             fmWarning() << "TextIndexDBus: Failed to reset CPU quota:" << msg;
-                         }
                          emit q->TaskFinished(type, path, success);
                      });
 
     QObject::connect(runtime->taskManager(), &TaskManager::taskProgressChanged,
                      q, [this](const QString &type, const QString &path, qint64 count, qint64 total) {
                          emit q->TaskProgressChanged(type, path, count, total);
+                     });
+
+    QObject::connect(runtime->taskManager(), &TaskManager::indexStatusChanged,
+                     q, [this](const QString &state, const QString &grade) {
+                         emit q->IndexStatusChanged(state, grade);
                      });
 
     QObject::connect(runtime->fsEventController(), &FSEventController::requestProcessFileChanges,
@@ -113,7 +112,7 @@ void TextIndexDBusPrivate::handleSlientStart()
         // 1. 首先检查索引数据库是否存在
         if (!q->IndexDatabaseExists()) {
             fmInfo() << "TextIndexDBus: Index database does not exist, starting create task for:" << pathsToProcess;
-            runtime->taskManager()->startTask(IndexTask::Type::Create, pathsToProcess, true);
+            runtime->taskManager()->startTask(IndexTask::Type::Create, pathsToProcess);
             return;
         }
 
@@ -132,7 +131,7 @@ void TextIndexDBusPrivate::handleSlientStart()
         if (needsRebuild || needsRecovery) {
             fmInfo() << "TextIndexDBus: Starting update task - needsRebuild:" << needsRebuild
                      << "needsRecovery:" << needsRecovery << "for:" << pathsToProcess;
-            runtime->taskManager()->startTask(IndexTask::Type::Update, pathsToProcess, true);
+            runtime->taskManager()->startTask(IndexTask::Type::Update, pathsToProcess);
             return;
         }
 
@@ -202,14 +201,14 @@ void TextIndexDBus::SetEnabled(bool enabled)
 
 bool TextIndexDBus::CreateIndexTask(const QStringList &paths, const QVariantMap &options)
 {
-    bool silent = options.value("silent", false).toBool();
-    return d->runtime->taskManager()->startTask(IndexTask::Type::Create, paths, silent);
+    Q_UNUSED(options)
+    return d->runtime->taskManager()->startTask(IndexTask::Type::Create, paths);
 }
 
 bool TextIndexDBus::UpdateIndexTask(const QStringList &paths, const QVariantMap &options)
 {
-    bool silent = options.value("silent", false).toBool();
-    return d->runtime->taskManager()->startTask(IndexTask::Type::Update, paths, silent);
+    Q_UNUSED(options)
+    return d->runtime->taskManager()->startTask(IndexTask::Type::Update, paths);
 }
 
 bool TextIndexDBus::StopCurrentTask()
@@ -264,19 +263,19 @@ bool TextIndexDBus::ProcessFileChanges(const QStringList &createdFiles,
     // 处理删除的文件（优先处理，因为这些文件可能已经不存在）
     if (!deletedFiles.isEmpty()) {
         fmInfo() << "TextIndexDBus: Processing" << deletedFiles.size() << "deleted files";
-        tasksQueued = d->runtime->taskManager()->startFileListTask(IndexTask::Type::RemoveFileList, deletedFiles, true) || tasksQueued;
+        tasksQueued = d->runtime->taskManager()->startFileListTask(IndexTask::Type::RemoveFileList, deletedFiles) || tasksQueued;
     }
 
     // 处理新增的文件
     if (!createdFiles.isEmpty()) {
         fmInfo() << "TextIndexDBus: Processing" << createdFiles.size() << "created files";
-        tasksQueued = d->runtime->taskManager()->startFileListTask(IndexTask::Type::CreateFileList, createdFiles, true) || tasksQueued;
+        tasksQueued = d->runtime->taskManager()->startFileListTask(IndexTask::Type::CreateFileList, createdFiles) || tasksQueued;
     }
 
     // 处理修改的文件
     if (!modifiedFiles.isEmpty()) {
         fmInfo() << "TextIndexDBus: Processing" << modifiedFiles.size() << "modified files";
-        tasksQueued = d->runtime->taskManager()->startFileListTask(IndexTask::Type::UpdateFileList, modifiedFiles, true) || tasksQueued;
+        tasksQueued = d->runtime->taskManager()->startFileListTask(IndexTask::Type::UpdateFileList, modifiedFiles) || tasksQueued;
     }
 
     return tasksQueued;
@@ -292,9 +291,40 @@ bool TextIndexDBus::ProcessFileMoves(const QHash<QString, QString> &movedFiles)
     fmInfo() << "TextIndexDBus: Processing" << movedFiles.size() << "moved files";
 
     // 启动文件移动任务
-    bool taskQueued = d->runtime->taskManager()->startFileMoveTask(movedFiles, true);
+    bool taskQueued = d->runtime->taskManager()->startFileMoveTask(movedFiles);
 
     return taskQueued;
+}
+
+QVariantMap TextIndexDBus::GetIndexStatus()
+{
+    QVariantMap status;
+    auto *tm = d->runtime->taskManager();
+
+    // Always delegate to TaskManager::currentIndexStatus() so the client
+    // receives the specific waiting state (WaitingPower / WaitingPowerSave /
+    // WaitingIdle / WaitingUpgrade / Failed / Running / Idle) rather than
+    // the generic "Blocked"/"Idle" that bypasses environment checks.
+    status["state"] = tm->currentIndexStatus();
+    auto grade = tm->currentOrQueuedGrade();
+    status["grade"] = grade.has_value() ? TaskManager::gradeToString(*grade) : QStringLiteral("none");
+
+    return status;
+}
+
+bool TextIndexDBus::ForceUpdateIndex(const QStringList &paths, const QVariantMap &options)
+{
+    const bool manual = options.value("manual", true).toBool();
+    fmInfo() << "TextIndexDBus: Force update index requested for" << paths.size() << "paths"
+             << "manual:" << manual;
+
+    bool exists = IndexDatabaseExists();
+    auto type = exists ? IndexTask::Type::Update : IndexTask::Type::Create;
+
+    if (manual) {
+        return d->runtime->taskManager()->startTask(type, paths, IndexTask::Grade::Manual, true);
+    }
+    return d->runtime->taskManager()->startTask(type, paths, IndexTask::Grade::None, true);
 }
 
 void TextIndexDBusPrivate::initializeSupportedExtensions()

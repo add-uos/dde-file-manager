@@ -152,24 +152,14 @@ CustomViewProperty WorkspaceHelper::findCustomViewProperty(const QString &scheme
     return CustomViewProperty();
 }
 
-void WorkspaceHelper::registerViewHint(const QString &scheme, const ViewHintSpec &spec)
+QObject *WorkspaceHelper::requestShowViewHint(quint64 windowId, const QVariantMap &content)
 {
-    if (scheme.isEmpty()) {
-        fmWarning() << "Cannot register view hint with empty scheme";
-        return;
+    auto *widget = findWorkspaceByWindowId(windowId);
+    if (!widget) {
+        fmWarning() << "WorkspaceHelper: no workspace for windowId:" << windowId;
+        return nullptr;
     }
-    viewHintMap.insert(scheme, spec);
-    fmInfo() << "Registered view hint for scheme:" << scheme;
-}
-
-bool WorkspaceHelper::hasViewHint(const QString &scheme) const
-{
-    return viewHintMap.contains(scheme);
-}
-
-ViewHintSpec WorkspaceHelper::findViewHint(const QString &scheme) const
-{
-    return viewHintMap.value(scheme);
+    return widget->showViewHint(content);
 }
 
 bool WorkspaceHelper::isViewModeSupported(const QString &scheme, const dfmbase::Global::ViewMode mode) const

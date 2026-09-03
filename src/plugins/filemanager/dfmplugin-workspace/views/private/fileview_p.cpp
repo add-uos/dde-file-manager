@@ -118,9 +118,10 @@ void FileViewPrivate::initListModeView()
     }
 
     if (!headerView) {
-        q->initDefaultHeaderView();
 
         headerView = new HeaderView(Qt::Orientation::Horizontal, q);
+        headerView->setObjectName("HeaderView");
+        headerView->setAccessibleName("HeaderView");
 
         headerView->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
         headerView->setFixedHeight(kListViewHeaderHeight);

@@ -5,7 +5,6 @@
 #include "ocrindexdbus.h"
 #include "private/ocrindexdbus_p.h"
 #include "utils/indexutility.h"
-#include "utils/systemdcpuutils.h"
 #include "utils/textindexconfig.h"
 
 #include <QDir>
@@ -45,17 +44,17 @@ void OcrIndexDBusPrivate::initConnect()
 {
     QObject::connect(runtime->taskManager(), &TaskManager::taskFinished,
                      q, [this](const QString &type, const QString &path, bool success) {
-                         QString msg;
-                         fmDebug() << "OcrIndexDBus: Resetting CPU limit after task completion";
-                         if (!SystemdCpuUtils::resetCpuQuota(Defines::kTextIndexServiceName, &msg)) {
-                             fmWarning() << "OcrIndexDBus: Failed to reset CPU quota:" << msg;
-                         }
                          emit q->TaskFinished(type, path, success);
                      });
 
     QObject::connect(runtime->taskManager(), &TaskManager::taskProgressChanged,
                      q, [this](const QString &type, const QString &path, qint64 count, qint64 total) {
                          emit q->TaskProgressChanged(type, path, count, total);
+                     });
+
+    QObject::connect(runtime->taskManager(), &TaskManager::indexStatusChanged,
+                     q, [this](const QString &state, const QString &grade) {
+                         emit q->IndexStatusChanged(state, grade);
                      });
 
     QObject::connect(runtime->fsEventController(), &FSEventController::requestProcessFileChanges,
@@ -115,7 +114,7 @@ void OcrIndexDBusPrivate::handleSlientStart()
 
         if (!q->IndexDatabaseExists()) {
             fmInfo() << "OcrIndexDBus: Index database does not exist, starting create task for:" << pathsToProcess;
-            runtime->taskManager()->startTask(IndexTask::Type::Create, pathsToProcess, true);
+            runtime->taskManager()->startTask(IndexTask::Type::Create, pathsToProcess);
             return;
         }
 
@@ -131,7 +130,7 @@ void OcrIndexDBusPrivate::handleSlientStart()
         if (needsRebuild || needsRecovery) {
             fmInfo() << "OcrIndexDBus: Starting update task - needsRebuild:" << needsRebuild
                      << "needsRecovery:" << needsRecovery << "for:" << pathsToProcess;
-            runtime->taskManager()->startTask(IndexTask::Type::Update, pathsToProcess, true);
+            runtime->taskManager()->startTask(IndexTask::Type::Update, pathsToProcess);
             return;
         }
 
@@ -196,14 +195,14 @@ void OcrIndexDBus::SetEnabled(bool enabled)
 
 bool OcrIndexDBus::CreateIndexTask(const QStringList &paths, const QVariantMap &options)
 {
-    bool silent = options.value("silent", false).toBool();
-    return d->runtime->taskManager()->startTask(IndexTask::Type::Create, paths, silent);
+    Q_UNUSED(options)
+    return d->runtime->taskManager()->startTask(IndexTask::Type::Create, paths);
 }
 
 bool OcrIndexDBus::UpdateIndexTask(const QStringList &paths, const QVariantMap &options)
 {
-    bool silent = options.value("silent", false).toBool();
-    return d->runtime->taskManager()->startTask(IndexTask::Type::Update, paths, silent);
+    Q_UNUSED(options)
+    return d->runtime->taskManager()->startTask(IndexTask::Type::Update, paths);
 }
 
 bool OcrIndexDBus::StopCurrentTask()
@@ -255,17 +254,17 @@ bool OcrIndexDBus::ProcessFileChanges(const QStringList &createdFiles,
 
     if (!deletedFiles.isEmpty()) {
         fmInfo() << "OcrIndexDBus: Processing" << deletedFiles.size() << "deleted files";
-        tasksQueued = d->runtime->taskManager()->startFileListTask(IndexTask::Type::RemoveFileList, deletedFiles, true) || tasksQueued;
+        tasksQueued = d->runtime->taskManager()->startFileListTask(IndexTask::Type::RemoveFileList, deletedFiles) || tasksQueued;
     }
 
     if (!createdFiles.isEmpty()) {
         fmInfo() << "OcrIndexDBus: Processing" << createdFiles.size() << "created files";
-        tasksQueued = d->runtime->taskManager()->startFileListTask(IndexTask::Type::CreateFileList, createdFiles, true) || tasksQueued;
+        tasksQueued = d->runtime->taskManager()->startFileListTask(IndexTask::Type::CreateFileList, createdFiles) || tasksQueued;
     }
 
     if (!modifiedFiles.isEmpty()) {
         fmInfo() << "OcrIndexDBus: Processing" << modifiedFiles.size() << "modified files";
-        tasksQueued = d->runtime->taskManager()->startFileListTask(IndexTask::Type::UpdateFileList, modifiedFiles, true) || tasksQueued;
+        tasksQueued = d->runtime->taskManager()->startFileListTask(IndexTask::Type::UpdateFileList, modifiedFiles) || tasksQueued;
     }
 
     return tasksQueued;
@@ -279,7 +278,38 @@ bool OcrIndexDBus::ProcessFileMoves(const QHash<QString, QString> &movedFiles)
     }
 
     fmInfo() << "OcrIndexDBus: Processing" << movedFiles.size() << "moved files";
-    return d->runtime->taskManager()->startFileMoveTask(movedFiles, true);
+    return d->runtime->taskManager()->startFileMoveTask(movedFiles);
+}
+
+QVariantMap OcrIndexDBus::GetIndexStatus()
+{
+    QVariantMap status;
+    auto *tm = d->runtime->taskManager();
+
+    // Always delegate to TaskManager::currentIndexStatus() so the client
+    // receives the specific waiting state (WaitingPower / WaitingPowerSave /
+    // WaitingIdle / WaitingUpgrade / Failed / Running / Idle) rather than
+    // the generic "Blocked"/"Idle" that bypasses environment checks.
+    status["state"] = tm->currentIndexStatus();
+    auto grade = tm->currentOrQueuedGrade();
+    status["grade"] = grade.has_value() ? TaskManager::gradeToString(*grade) : QStringLiteral("none");
+
+    return status;
+}
+
+bool OcrIndexDBus::ForceUpdateIndex(const QStringList &paths, const QVariantMap &options)
+{
+    const bool manual = options.value("manual", true).toBool();
+    fmInfo() << "OcrIndexDBus: Force update index requested for" << paths.size() << "paths"
+             << "manual:" << manual;
+
+    bool exists = IndexDatabaseExists();
+    auto type = exists ? IndexTask::Type::Update : IndexTask::Type::Create;
+
+    if (manual) {
+        return d->runtime->taskManager()->startTask(type, paths, IndexTask::Grade::Manual, true);
+    }
+    return d->runtime->taskManager()->startTask(type, paths, IndexTask::Grade::None, true);
 }
 
 void OcrIndexDBusPrivate::initializeSupportedExtensions()

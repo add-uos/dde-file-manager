@@ -11,10 +11,12 @@
 #include <QDateTime>
 #include <QStandardPaths>
 #include <QDir>
+#include <QScrollBar>
+#include <QTextCursor>
 
 MainWindow::MainWindow(QWidget *parent)
     : DMainWindow(parent)
-    , m_envDetector(new EnvDetector(this))
+    , m_envDetector(&EnvDetector::instance())
     , m_powerMonitor(new PowerMonitor(this))
     , m_idleMonitor(new IdleMonitor(this))
     , m_loadMonitor(new LoadMonitor(this))
@@ -39,7 +41,8 @@ MainWindow::MainWindow(QWidget *parent)
 MainWindow::~MainWindow()
 {
     if (m_running) {
-        m_envDetector->stop();
+        // EnvDetector is a singleton — don't stop it here, only stop the
+        // monitors we own.
         m_powerMonitor->stop();
         m_idleMonitor->stop();
         m_loadMonitor->stop();
@@ -128,7 +131,7 @@ void MainWindow::onStart()
 
 void MainWindow::onStop()
 {
-    m_envDetector->stop();
+    // EnvDetector is a singleton — don't stop it, only stop owned monitors.
     m_powerMonitor->stop();
     m_idleMonitor->stop();
     m_loadMonitor->stop();
@@ -211,12 +214,28 @@ void MainWindow::refreshDisplay()
     bool diskOk = m_loadMonitor->isDiskBelowThreshold();
     html += QString("cpuAvgPercent(): %1 % (instant: %2 %)<br>").arg(cpu, 0, 'f', 2).arg(m_loadMonitor->cpuInstantPercent(), 0, 'f', 2);
     html += QString("diskBusyPercent(): %1 % (instant: %2 %)<br>").arg(disk, 0, 'f', 2).arg(m_loadMonitor->diskInstantPercent(), 0, 'f', 2);
-    html += numericLabeled(cpuOk, "isCpuBelowThreshold():", "(阈值: 30 %)") + "<br>";
-    html += numericLabeled(diskOk, "isDiskBelowThreshold():", "(阈值: 50 %)") + "<br>";
+    html += numericLabeled(cpuOk, "isCpuBelowThreshold():",
+                           QStringLiteral("(阈值: %1 %)").arg(m_loadMonitor->cpuThresholdPercent())) + "<br>";
+    html += numericLabeled(diskOk, "isDiskBelowThreshold():",
+                           QStringLiteral("(阈值: %1 %)").arg(m_loadMonitor->diskThresholdPercent())) + "<br>";
 
     html += "</pre>";
 
+    // Skip refresh while user is selecting text — setHtml replaces the
+    // entire document and destroys any active selection.
+    if (m_statusView->textCursor().hasSelection()) {
+        return;
+    }
+
+    // Save scroll position before setHtml resets it to top
+    QScrollBar *vBar = m_statusView->verticalScrollBar();
+    int scrollPos = vBar ? vBar->value() : 0;
+
     m_statusView->setHtml(html);
+
+    if (vBar) {
+        vBar->setValue(scrollPos);
+    }
 }
 
 void MainWindow::onEnvStateChanged(const EnvState &state)

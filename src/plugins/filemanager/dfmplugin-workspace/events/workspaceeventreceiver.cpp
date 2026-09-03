@@ -67,8 +67,8 @@ void WorkspaceEventReceiver::initConnection()
                             WorkspaceEventReceiver::instance(), &WorkspaceEventReceiver::handleFindMenuScene);
     dpfSlotChannel->connect(kCurrentEventSpace, "slot_RegisterCustomTopWidget",
                             WorkspaceEventReceiver::instance(), &WorkspaceEventReceiver::handleRegisterCustomTopWidget);
-    dpfSlotChannel->connect(kCurrentEventSpace, "slot_RegisterViewHint",
-                            WorkspaceEventReceiver::instance(), &WorkspaceEventReceiver::handleRegisterViewHint);
+    dpfSlotChannel->connect(kCurrentEventSpace, "slot_ShowViewHint",
+                            WorkspaceEventReceiver::instance(), &WorkspaceEventReceiver::handleShowViewHint);
     dpfSlotChannel->connect(kCurrentEventSpace, "slot_RegisterGroupStrategy",
                             WorkspaceEventReceiver::instance(), &WorkspaceEventReceiver::handleRegisterGroupStrategy);
     dpfSlotChannel->connect(kCurrentEventSpace, "slot_RegisteredGroupStrategies",
@@ -426,15 +426,9 @@ void WorkspaceEventReceiver::handleRegisterCustomTopWidget(const QVariantMap &da
     });
 }
 
-void WorkspaceEventReceiver::handleRegisterViewHint(const QVariantMap &dataMap)
+QObject *WorkspaceEventReceiver::handleShowViewHint(quint64 windowId, const QVariantMap &content)
 {
-    ViewHintSpec spec(dataMap);
-    if (spec.scheme.isEmpty()) {
-        fmWarning() << "WorkspaceEventReceiver: view hint spec has empty scheme, ignored";
-        return;
-    }
-    fmDebug() << "WorkspaceEventReceiver: Registering view hint for scheme:" << spec.scheme;
-    WorkspaceHelper::instance()->registerViewHint(spec.scheme, spec);
+    return WorkspaceHelper::instance()->requestShowViewHint(windowId, content);
 }
 
 void WorkspaceEventReceiver::handleRegisterGroupStrategy(const QVariantMap &dataMap)

@@ -353,37 +353,66 @@ void WorkspacePage::setCurrentView(const QUrl &url)
         viewStateChanged();
 
     if (prevScheme != url.scheme()) {
-        tryShowViewHint(url);
-        fmDebug() << "setCurrentView: tryShowViewHint called for url:" << url;
+        if (currentHint) {
+            currentHint->close();
+            currentHint = nullptr;
+        }
     }
 }
 
-void WorkspacePage::tryShowViewHint(const QUrl &url)
+QObject *WorkspacePage::showViewHint(const QVariantMap &content)
 {
     if (currentHint) {
-        currentHint->close();   // -> msg WA_DeleteOnClose-deleted -> controller self-deletes
-        currentHint = nullptr;   // detach our handle now; object cleans up asynchronously
+        currentHint->close();
+        currentHint = nullptr;
     }
 
-    const ViewHintSpec spec = WorkspaceHelper::instance()->findViewHint(url.scheme());
-    if (!spec.shouldShow)
-        return;
-    QString text;
-    if (!spec.shouldShow(url, &text))
-        return;
-
     auto *hint = new ViewHintMessage(this);
-    hint->setIcon(spec.icon);
-    hint->setText(text);
-    hint->setActions(spec.actions);
+    applyContentToHint(hint, content);
     hint->setAutoDismissOnAction(true);
-    connect(hint, &ViewHintMessage::actionTriggered, this, [this, spec](const QString &id) {
-        if (spec.onAction)
-            spec.onAction(id);
-        currentHint = nullptr;   // controller self-deletes via the message's destroyed signal
-    });
+    trackHintLifetime(hint);
     hint->show(this);
     currentHint = hint;
+    return hint;
+}
+
+void WorkspacePage::applyContentToHint(ViewHintMessage *hint, const QVariantMap &content)
+{
+    if (content.contains(ViewHintUpdateKey::kIcon))
+        hint->setIcon(content.value(ViewHintUpdateKey::kIcon).toString());
+
+    if (content.contains(ViewHintUpdateKey::kText))
+        hint->setText(content.value(ViewHintUpdateKey::kText).toString());
+
+    if (content.contains(ViewHintUpdateKey::kActions)) {
+        QList<QPair<QString, QString>> actions;
+        const QVariantList actionList = content.value(ViewHintUpdateKey::kActions).toList();
+        for (const QVariant &v : actionList) {
+            const QVariantMap m = v.toMap();
+            actions.append({ m.value("id").toString(), m.value("label").toString() });
+        }
+        hint->setActions(actions);
+    }
+
+    if (content.contains(ViewHintUpdateKey::kLeftCustomWidgetFactory)) {
+        auto factory = DPF_NAMESPACE::paramGenerator<DFMBASE_NAMESPACE::ViewHintCustomWidgetFactory>(
+                content.value(ViewHintUpdateKey::kLeftCustomWidgetFactory));
+        hint->setCustomWidgetFactory(factory, ViewHintMessage::Side::Left);
+    }
+
+    if (content.contains(ViewHintUpdateKey::kRightCustomWidgetFactory)) {
+        auto factory = DPF_NAMESPACE::paramGenerator<DFMBASE_NAMESPACE::ViewHintCustomWidgetFactory>(
+                content.value(ViewHintUpdateKey::kRightCustomWidgetFactory));
+        hint->setCustomWidgetFactory(factory, ViewHintMessage::Side::Right);
+    }
+}
+
+void WorkspacePage::trackHintLifetime(ViewHintMessage *hint)
+{
+    connect(hint, &ViewHintMessage::closed, this, [this, hint]() {
+        if (currentHint == hint)
+            currentHint = nullptr;
+    });
 }
 
 void WorkspacePage::playDisappearAnimation(ViewPtr view)

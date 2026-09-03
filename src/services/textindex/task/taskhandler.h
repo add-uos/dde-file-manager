@@ -22,9 +22,11 @@ struct HandlerResult
 {
     bool success { false };
     bool interrupted { false };
+    bool paused { false };
     bool useAnything { false };
     bool fatal { false };
     bool indexChanged { false };
+    QStringList remainingFiles;
 };
 
 using TaskHandler = std::function<HandlerResult(const QString &path, TaskState &state)>;
@@ -33,6 +35,11 @@ using TaskHandler = std::function<HandlerResult(const QString &path, TaskState &
 namespace TaskHandlers {
 TaskHandler CreateIndexHandler(const IndexContext &context);
 TaskHandler UpdateIndexHandler(const IndexContext &context);
+
+/// Handler for resuming an interrupted Create task. Skips cleanupIndexs, uses cached
+/// file list + checkpoint from IndexStateStore when available, or falls back to BFS.
+/// Only selected by TaskManager when createInProgress is true.
+TaskHandler CreateResumeHandler(const IndexContext &context);
 
 // 文件列表任务处理器
 TaskHandler CreateOrUpdateFileListHandler(const IndexContext &context, const QStringList &fileList);

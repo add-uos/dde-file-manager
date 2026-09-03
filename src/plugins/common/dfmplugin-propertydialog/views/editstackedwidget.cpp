@@ -12,6 +12,7 @@
 #include <dfm-base/utils/elidetextlayout.h>
 #include <dfm-base/utils/universalutils.h>
 #include <dfm-base/utils/fileutils.h>
+#include <dfm-base/widgets/dfmcustombuttons/customiconbutton.h>
 
 #include <dfm-framework/dpf.h>
 
@@ -21,7 +22,7 @@
 #include <QPainter>
 #include <QFileInfo>
 #include <QLabel>
-#include <QPainterPath>
+#include <DStyle>
 
 Q_DECLARE_METATYPE(QList<QUrl> *)
 
@@ -29,8 +30,9 @@ DWIDGET_USE_NAMESPACE
 DFMBASE_USE_NAMESPACE
 using namespace dfmplugin_propertydialog;
 
-static constexpr int kTextLineHeight { 18 };
 static constexpr int kExtendedWidgetWidth { 360 };
+static constexpr int kTextPadding { 4 };
+static constexpr int kTextShowWidth { 340 };
 
 NameTextEdit::NameTextEdit(const QString &text, QWidget *parent)
     : DTextEdit(text, parent)
@@ -40,8 +42,11 @@ NameTextEdit::NameTextEdit(const QString &text, QWidget *parent)
     setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     setFrameShape(QFrame::NoFrame);
-    setFixedSize(kExtendedWidgetWidth, 60);
+    setFixedWidth(kExtendedWidgetWidth);
     setContextMenuPolicy(Qt::NoContextMenu);
+
+    installEventFilter(this);
+    adjustStyle();
 
     connect(this, &QTextEdit::textChanged, this, &NameTextEdit::slotTextChanged);
 }
@@ -63,12 +68,6 @@ bool NameTextEdit::isCanceled() const
 void NameTextEdit::setIsCanceled(bool isCanceled)
 {
     isCancel = isCanceled;
-}
-
-void NameTextEdit::setPlainText(const QString &text)
-{
-    QTextEdit::setPlainText(text);
-    setAlignment(Qt::AlignCenter);
 }
 
 void NameTextEdit::slotTextChanged()
@@ -109,19 +108,12 @@ void NameTextEdit::slotTextChanged()
 
     // Step 4: Apply changes to the editor
     if (text != toPlainText()) {
-        setPlainText(text);
+        QTextEdit::setPlainText(text);
     }
 
     QTextCursor cursor = textCursor();
-    cursor.movePosition(QTextCursor::Start);
-    do {
-        QTextBlockFormat fmt = cursor.blockFormat();
-        fmt.setLineHeight(kTextLineHeight, QTextBlockFormat::FixedHeight);
-        cursor.setBlockFormat(fmt);
-    } while (cursor.movePosition(QTextCursor::NextBlock));
     cursor.setPosition(endPos);
     setTextCursor(cursor);
-    setAlignment(Qt::AlignHCenter);
 
     if (isReadOnly())
         setFixedHeight(static_cast<int>(document()->size().height()));
@@ -160,6 +152,37 @@ void NameTextEdit::showAlertMessage(const QString &text, int duration)
 void NameTextEdit::focusOutEvent(QFocusEvent *event)
 {
     QTextEdit::focusOutEvent(event);
+}
+
+bool NameTextEdit::eventFilter(QObject *obj, QEvent *e)
+{
+    if (e->type() == QEvent::Paint && obj == this) {
+        const int oldFrameRadius = DStyle::pixelMetric(style(), DStyle::PM_FrameRadius, nullptr, this);
+        const int frameRadius = DStyle::pixelMetric(style(), DStyle::PM_FrameRadius);
+
+        DStyle::setFrameRadius(this, frameRadius);
+
+        QPainter p(this);
+        p.setRenderHints(QPainter::Antialiasing);
+
+        QStyleOptionFrame panel;
+        initStyleOption(&panel);
+        style()->drawPrimitive(QStyle::PE_PanelLineEdit, &panel, &p, this);
+
+        DStyle::setFrameRadius(this, oldFrameRadius);
+        return true;
+    }
+
+    return DTextEdit::eventFilter(obj, e);
+}
+
+void NameTextEdit::adjustStyle()
+{
+    document()->setDocumentMargin(kTextPadding);
+    QTextOption opt = document()->defaultTextOption();
+    opt.setAlignment(Qt::AlignLeft);
+    document()->setDefaultTextOption(opt);
+    DTK_WIDGET_NAMESPACE::DStyle::setFrameRadius(this, 0);
 }
 
 void NameTextEdit::keyPressEvent(QKeyEvent *event)
@@ -226,7 +249,7 @@ void EditStackedWidget::initUI()
 void EditStackedWidget::initTextShowFrame(QString fileName)
 {
     auto originalFileName = fileName;   // 存储原始文件名
-    QRect rect(QPoint(0, 0), QSize(200, 66));
+    QRect rect(QPoint(0, 0), QSize(kTextShowWidth, 66));
     QStringList labelTexts;
     ElideTextLayout layout(fileName);
     layout.layout(rect, Qt::ElideMiddle, nullptr, Qt::NoBrush, &labelTexts);
@@ -239,14 +262,14 @@ void EditStackedWidget::initTextShowFrame(QString fileName)
     } else {
         textShowFrame = new QFrame(this);
     }
+    textShowFrame->setFixedWidth(kExtendedWidgetWidth);
 
-    nameEditIcon = new DIconButton(textShowFrame);
+    nameEditIcon = new CustomDIconButton(textShowFrame);
     nameEditIcon->setAccessibleName("NameEditIcon");
     nameEditIcon->setObjectName(QString("EditButton"));
     nameEditIcon->setIcon(QIcon::fromTheme("dfm_rename"));
     nameEditIcon->setIconSize({ 12, 12 });
-    nameEditIcon->setFixedSize(24, 24);
-    nameEditIcon->setFlat(true);
+    nameEditIcon->setFixedSize(30, 30);
 
     connect(nameEditIcon, &QPushButton::clicked, this, &EditStackedWidget::renameFile);
 
@@ -255,15 +278,21 @@ void EditStackedWidget::initTextShowFrame(QString fileName)
         DLabel *fileNameLabel = new DLabel(labelText, textShowFrame);
         fileNameLabel->setTextFormat(Qt::PlainText);
         fileNameLabel->setAlignment(Qt::AlignHCenter);
+        fileNameLabel->setContentsMargins(0, 0, 0, 0);
+        fileNameLabel->setMargin(0);
         textHeight += fileNameLabel->fontInfo().pixelSize() + 10;
 
         QHBoxLayout *hLayout = new QHBoxLayout;
         hLayout->addStretch(1);
-        hLayout->addWidget(fileNameLabel);
+        hLayout->addWidget(fileNameLabel, 0, Qt::AlignVCenter);
 
         if (labelText == labelTexts.last()) {
-            hLayout->addSpacing(2);
-            hLayout->addWidget(nameEditIcon);
+            fileNameLabel->setStyleSheet("padding-right: 6px;");
+            QVBoxLayout *btnWrap = new QVBoxLayout;
+            btnWrap->setContentsMargins(0, -7, 0, 0);
+            btnWrap->setSpacing(0);
+            btnWrap->addWidget(nameEditIcon);
+            hLayout->addLayout(btnWrap);
         } else if (fileNameLabel->fontMetrics().horizontalAdvance(labelText) > (rect.width() - 10)) {
             fileNameLabel->setFixedWidth(rect.width());
         }

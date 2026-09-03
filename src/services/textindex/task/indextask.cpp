@@ -48,34 +48,44 @@ void IndexTask::onProgressChanged(qint64 count, qint64 total)
     }
 }
 
-bool IndexTask::silent() const
+void IndexTask::applyResourcePolicy()
 {
-    return m_silent;
-}
-
-void IndexTask::setSilent(bool newSilent)
-{
-    fmDebug() << "[IndexTask::setSilent] Silent mode changed to:" << newSilent << "for path:" << m_path;
-    m_silent = newSilent;
-}
-
-void IndexTask::throttleCpuUsage()
-{
-    if (!silent()) {
-        fmDebug() << "[IndexTask::throttleCpuUsage] Skipping CPU throttling - not in silent mode";
-        return;
+    switch (m_grade) {
+    case Grade::Light:
+    case Grade::Medium:
+    case Grade::Heavy: {
+        int limit = TextIndexConfig::instance().cpuUsageLimitPercent();
+        fmDebug() << "[IndexTask::applyResourcePolicy] Acquiring CPU quota:" << limit
+                  << "% for grade:" << static_cast<int>(m_grade) << "service:" << Defines::kTextIndexServiceName;
+        SystemdCpuUtils::acquireCpuQuota(Defines::kTextIndexServiceName, limit);
+        break;
     }
+    case Grade::Manual: {
+        fmInfo() << "[IndexTask::applyResourcePolicy] Manual grade - resetting CPU quota for service:" << Defines::kTextIndexServiceName;
+        SystemdCpuUtils::manualTaskCpuQuota(Defines::kTextIndexServiceName);
+        break;
+    }
+    default:
+        fmWarning() << "[IndexTask::applyResourcePolicy] Unknown grade:" << static_cast<int>(m_grade);
+        break;
+    }
+}
 
-    int limit = TextIndexConfig::instance().cpuUsageLimitPercent();
-    fmDebug() << "[IndexTask::throttleCpuUsage] Applying CPU usage limit:" << limit << "% for service:"
-              << Defines::kTextIndexServiceName;
-
-    QString msg;
-    if (!SystemdCpuUtils::setCpuQuota(Defines::kTextIndexServiceName, limit, &msg)) {
-        fmWarning() << "[IndexTask::throttleCpuUsage] Failed to set CPU quota:" << msg
-                    << "service:" << Defines::kTextIndexServiceName << "limit:" << limit << "%";
-    } else {
-        fmDebug() << "[IndexTask::throttleCpuUsage] CPU quota applied successfully - limit:" << limit << "%";
+void IndexTask::releaseResourcePolicy()
+{
+    switch (m_grade) {
+    case Grade::Light:
+    case Grade::Medium:
+    case Grade::Heavy:
+        fmDebug() << "[IndexTask::releaseResourcePolicy] Releasing CPU quota for grade:" << static_cast<int>(m_grade);
+        SystemdCpuUtils::releaseCpuQuota(Defines::kTextIndexServiceName);
+        break;
+    case Grade::Manual:
+        fmDebug() << "[IndexTask::releaseResourcePolicy] Manual grade - resetting CPU quota";
+        SystemdCpuUtils::manualTaskCpuQuota(Defines::kTextIndexServiceName);
+        break;
+    default:
+        break;
     }
 }
 
@@ -87,7 +97,7 @@ void IndexTask::start()
     }
 
     fmInfo() << "[IndexTask::start] Starting task - type:" << static_cast<int>(m_type)
-             << "path:" << m_path << "silent:" << m_silent;
+             << "path:" << m_path;
 
     m_state.start();
     m_status = Status::Running;
@@ -103,6 +113,12 @@ void IndexTask::stop()
 {
     fmInfo() << "[IndexTask::stop] Stopping task - type:" << static_cast<int>(m_type) << "path:" << m_path;
     m_state.stop();
+}
+
+void IndexTask::requestPause()
+{
+    fmInfo() << "[IndexTask::requestPause] Requesting pause - type:" << static_cast<int>(m_type) << "path:" << m_path;
+    m_state.requestPause();
 }
 
 bool IndexTask::isRunning() const
@@ -125,6 +141,27 @@ IndexTask::Status IndexTask::status() const
     return m_status;
 }
 
+IndexTask::Grade IndexTask::grade() const
+{
+    return m_grade;
+}
+
+void IndexTask::setGrade(Grade grade)
+{
+    m_grade = grade;
+    fmInfo() << "[IndexTask::setGrade] Grade set to:" << static_cast<int>(grade) << "for path:" << m_path;
+}
+
+bool IndexTask::forceBypass() const
+{
+    return m_forceBypass;
+}
+
+void IndexTask::setForceBypass(bool bypass)
+{
+    m_forceBypass = bypass;
+}
+
 bool IndexTask::isIndexCorrupted() const
 {
     return m_indexCorrupted;
@@ -142,20 +179,25 @@ void IndexTask::setIndexCorrupted(bool corrupted)
 void IndexTask::doTask()
 {
     fmInfo() << "[IndexTask::doTask] Executing task handler - type:" << static_cast<int>(m_type)
-             << "path:" << m_path;
+             << "path:" << m_path << "grade:" << static_cast<int>(m_grade);
 
     HandlerResult result { false, false };
+    bool resourcePolicyApplied = false;
+
     if (m_handler) {
         try {
             setIndexCorrupted(false);
-            throttleCpuUsage();
-
-            m_state.setSilent(m_silent);
+            m_state.clearPauseRequest();
+            applyResourcePolicy();
+            resourcePolicyApplied = true;
 
             fmDebug() << "[IndexTask::doTask] Invoking task handler for path:" << m_path;
             result = m_handler(m_path, m_state);
 
-            if (result.fatal) {
+            if (m_state.isPauseRequested() && !result.success) {
+                result.paused = true;
+                fmInfo() << "[IndexTask::doTask] Task paused by request - path:" << m_path;
+            } else if (result.fatal) {
                 fmCritical() << "[IndexTask::doTask] Task handler reported fatal error - path:" << m_path;
                 setIndexCorrupted(true);
             } else if (!result.success) {
@@ -164,7 +206,6 @@ void IndexTask::doTask()
                 fmDebug() << "[IndexTask::doTask] Task handler completed successfully - path:" << m_path;
             }
         } catch (const LuceneException &e) {
-            // 捕获到 Lucene 异常，说明索引损坏
             fmCritical() << "[IndexTask::doTask] Lucene exception caught, index corrupted - path:" << m_path
                          << "error:" << QString::fromStdWString(e.getError());
             setIndexCorrupted(true);
@@ -173,7 +214,7 @@ void IndexTask::doTask()
             fmCritical() << "[IndexTask::doTask] Standard exception caught - path:" << m_path
                          << "error:" << e.what();
             result.success = false;
-        } catch (...) {   // 捕获所有异常
+        } catch (...) {
             fmCritical() << "[IndexTask::doTask] Unknown exception caught - path:" << m_path;
             result.success = false;
         }
@@ -181,16 +222,25 @@ void IndexTask::doTask()
         fmCritical() << "[IndexTask::doTask] No task handler provided - path:" << m_path;
     }
 
-    m_state.stop();
-    m_status = result.success ? Status::Finished : Status::Failed;
-
-    if (result.success) {
-        fmDebug() << "[IndexTask::doTask] Task completed successfully - type:" << static_cast<int>(m_type)
-                  << "path:" << m_path;
-    } else {
-        fmWarning() << "[IndexTask::doTask] Task failed - type:" << static_cast<int>(m_type)
-                    << "path:" << m_path << "corrupted:" << m_indexCorrupted;
+    if (resourcePolicyApplied) {
+        releaseResourcePolicy();
     }
 
-    emit finished(m_type, result);
+    if (result.paused) {
+        m_status = Status::Paused;
+        emit paused(m_type, result);
+    } else {
+        m_state.stop();
+        m_status = result.success ? Status::Finished : Status::Failed;
+
+        if (result.success) {
+            fmDebug() << "[IndexTask::doTask] Task completed successfully - type:" << static_cast<int>(m_type)
+                      << "path:" << m_path;
+        } else {
+            fmWarning() << "[IndexTask::doTask] Task failed - type:" << static_cast<int>(m_type)
+                        << "path:" << m_path << "corrupted:" << m_indexCorrupted;
+        }
+
+        emit finished(m_type, result);
+    }
 }

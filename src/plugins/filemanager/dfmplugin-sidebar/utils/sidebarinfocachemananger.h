@@ -28,9 +28,11 @@ public:
 
     bool contains(const ItemInfo &info) const;
     bool contains(const QUrl &url) const;
+    bool contains(const Group &name, const QUrl &url) const;
     GroupList groups() const;
     CacheInfoList indexCacheList(const Group &name) const;
-    ItemInfo itemInfo(const QUrl &url);   // the funcs is for QHash<QUrl, ItemInfo> bindedInfos;
+    ItemInfo itemInfo(const QUrl &url);
+    ItemInfo itemInfo(const Group &name, const QUrl &url);
 
     bool addItemInfoCache(const ItemInfo &info);
     bool insertItemInfoCache(Index i, const ItemInfo &info);
@@ -52,7 +54,6 @@ private:
 
 private:
     GroupCacheMap cacheInfoMap;
-    QHash<QUrl, ItemInfo> bindedInfos;
     QStringList lastSettingKeys;
     QStringList lastSettingBindingKeys;
 };
